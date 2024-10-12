@@ -38,7 +38,7 @@ For a deeper dive into the theory, please refer to the `TIDALpaper.txt` in the r
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/TIDAL.git
+   git clone https://github.com/IreGaddr/TIDAL.git
    cd TIDAL
    ```
 
