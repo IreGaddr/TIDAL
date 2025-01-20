@@ -1,177 +1,297 @@
 # train.py
-
 import json
 import numpy as np
 import pandas as pd
-
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-from tidal.core import IOT, WaveFunction, TautochroneOperator, ObservationalDensity, DoublyLinkedCausalEvolution, parameterized_warping_function, parameterized_hamiltonian, parameterized_complexity_function, generate_basis_functions, normalize_data
+from tidal.core import (IOT, WaveFunction, TautochroneOperator, ObservationalDensity, 
+                       DoublyLinkedCausalEvolution, parameterized_warping_function, 
+                       parameterized_hamiltonian, parameterized_complexity_function, 
+                       generate_basis_functions)
 from tidal.traversal import IOTTraversal
-from tidal.backprop import IOTAdaptiveOptimizer, TIDALOptimizer, TIDALTrainer, cosine_annealing_scheduler
-import pickle
+from tidal.backprop import IOTAdaptiveOptimizer, TIDALOptimizer, TIDALTrainer, cosine_annealing_scheduler, ForexLoss, ForexTIDALOptimizer, AdaptiveLRScheduler, WaveAwareTIDALOptimizer
+from typing import Tuple, List, Dict, Any
+import concurrent.futures
+from numba import jit, prange
+import multiprocessing
+from functools import partial
+from tidal.iot_db import IOTDatabase, IOTModelLoader
 
-def load_and_preprocess_data(file_path):
-    with open(file_path, 'r') as file:
-        data = json.load(file)
-    
-    reference_date = datetime(2000, 1, 1)
-    timestamps = [reference_date + timedelta(minutes=int(t)) for t in data['time']]
-    
-    df = pd.DataFrame({
-        'Time': timestamps,
-        'Open': data['open'],
-        'High': data['high'],
-        'Low': data['low'],
-        'Close': data['close'],
-        'Volume': data['volume']
-    })
-    
-    df.set_index('Time', inplace=True)
-    
-    # Feature engineering
-    df['Return'] = df['Close'].pct_change()
-    df['LogReturn'] = np.log(df['Close']) - np.log(df['Open'])
-    df['Volatility'] = df['Return'].rolling(window=21).std()
-    df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    df['SMA_200'] = df['Close'].rolling(window=200).mean()
-    df['RSI'] = 100 - 100 / (1 + df['Close'].diff().rolling(window=14).mean() / df['Close'].diff().rolling(window=14).std())
-    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
-    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()  
-    df.dropna(inplace=True)
-    
-    return df
+class DataLoader:
+    def __init__(self, num_workers: int = None):
+        self.num_workers = num_workers or multiprocessing.cpu_count()
 
-def map_to_iot(data, iot, lookback):
-    features = ['Open', 'High', 'Low', 'Volume', 'Return', 'LogReturn', 'Volatility', 'SMA_50', 'SMA_200', 'RSI', 'MACD', 'Signal', 'Close']
-    target = 'Close'
-    
-    feature_scaler = MinMaxScaler(feature_range=(0, 2*np.pi))
-    target_scaler = MinMaxScaler(feature_range=(0, 2*np.pi))
-    
-    scaled_features = feature_scaler.fit_transform(data[features])
-    scaled_target = target_scaler.fit_transform(data[[target]])
-    
-    X, y = [], []
-    for i in range(lookback, len(data)):
-        X.append(scaled_features[i-lookback:i])
-        y.append(scaled_target[i])
-    
-    X = np.array(X)
-    y = np.array(y)
-    
-    # Combine features for u, v, t coordinates
-    u = np.mean(scaled_features[lookback:, :3], axis=1)  # Average of Open, High, Low
-    v = np.mean(scaled_features[lookback:, 3:7], axis=1)  # Average of Volume, Return, LogReturn, Volatility
-    t = np.mean(scaled_features[lookback:, 7:], axis=1)  # Average of SMA_50, SMA_200, RSI, MACD, Signal, Close
-    
-    # Ensure u, v, t are within [0, 2π]
-    u = u % (2*np.pi)
-    v = v % (2*np.pi)
-    t = t % (2*np.pi)
-    
-    return (u, v, t), y.flatten(), feature_scaler, target_scaler
+    @staticmethod
+    def _parse_date(timestamp: int, reference_date: datetime) -> datetime:
+        return reference_date + timedelta(minutes=int(timestamp))
 
-def setup_tidal_model(iot, l_max, m_max):
-    basis_functions = generate_basis_functions(l_max, m_max)
-    wave_function = WaveFunction(iot, basis_functions)
-    tautochrone_op = TautochroneOperator(iot)
-    obs_density = ObservationalDensity(parameterized_complexity_function(262144, 262144, 262144))
-    warping_func = parameterized_warping_function(1e-33, 262144, 262144)
-    hamiltonian = parameterized_hamiltonian(warping_func)
-    evolution = DoublyLinkedCausalEvolution(hamiltonian, tautochrone_op, tautochrone_op, obs_density, 137.035999, 1e-33, 7.2973525643e-3)
-    
-    return wave_function, evolution
+    def _process_chunk(self, data: Tuple[pd.DataFrame, int]) -> pd.DataFrame:
+        """Process a chunk of data with technical indicators."""
+        chunk, idx = data
+        # Create a copy to avoid pandas warnings
+        chunk = chunk.copy()
+        
+        # Calculate technical indicators
+        chunk.loc[:, 'Return'] = chunk['Close'].pct_change()
+        chunk.loc[:, 'LogReturn'] = np.log(chunk['Close']) - np.log(chunk['Open'])
+        chunk.loc[:, 'Volatility'] = chunk['Return'].rolling(window=21).std()
+        chunk.loc[:, 'SMA_50'] = chunk['Close'].rolling(window=50).mean()
+        chunk.loc[:, 'SMA_200'] = chunk['Close'].rolling(window=200).mean()
+        
+        # RSI calculation
+        diff = chunk['Close'].diff()
+        gain = (diff.copy().where(diff > 0, 0)).rolling(window=14).mean()
+        loss = (-diff.copy().where(diff < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        chunk.loc[:, 'RSI'] = 100 - (100 / (1 + rs))
+        
+        # MACD calculation
+        ema12 = chunk['Close'].ewm(span=12, adjust=False).mean()
+        ema26 = chunk['Close'].ewm(span=26, adjust=False).mean()
+        chunk.loc[:, 'MACD'] = ema12 - ema26
+        chunk.loc[:, 'Signal'] = chunk['MACD'].ewm(span=9, adjust=False).mean()
+        
+        return chunk
 
-def train_model(wave_function, evolution, X_train, y_train, num_epochs, learning_rate):
-    optimizer = TIDALOptimizer(wave_function, learning_rate, delta=0.1, clip_value=1.0)
-    trainer = TIDALTrainer(wave_function, optimizer, evolution)
-    
-    lr_scheduler = lambda epoch, lr: cosine_annealing_scheduler(epoch, lr, T_max=num_epochs)
-    
-    trainer.train(X_train, y_train, num_epochs, dt=1e-33, lr_scheduler=lr_scheduler)
-    
-    return wave_function
+    def load_and_preprocess_data(self, file_path: str) -> pd.DataFrame:
+        """Load and preprocess data using parallel processing."""
+        with open(file_path, 'r') as file:
+            data = json.load(file)
+        reference_date = datetime(2000, 1, 1)
+        timestamps = [self._parse_date(t, reference_date) for t in data['time']]
+        df = pd.DataFrame({
+            'Time': timestamps,
+            'Open': data['open'],
+            'High': data['high'],
+            'Low': data['low'],
+            'Close': data['close'],
+            'Volume': data['volume']
+        })
+        
+        df.set_index('Time', inplace=True)
+        
+        # Split data into chunks for parallel processing
+        chunk_size = max(2000, len(df) // self.num_workers)
+        chunks = [(df[i:i + chunk_size], i) for i in range(0, len(df), chunk_size)]
+        
+        # Process chunks in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            processed_chunks = list(executor.map(self._process_chunk, chunks))
+        # Combine processed chunks
+        df = pd.concat(processed_chunks)
+        df.sort_index(inplace=True)
+        df.dropna(inplace=True)
+        return df
 
-def predict(wave_function, X, target_scaler):
-    raw_predictions = np.array([np.abs(wave_function(*coords)) for coords in X])
-    return target_scaler.inverse_transform(raw_predictions.reshape(-1, 1))[:, 0]
+@jit(nopython=True, parallel=True)
+def _compute_means(features: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute means for feature groups using Numba."""
+    n_samples = len(features) - lookback
+    u = np.zeros(n_samples)
+    v = np.zeros(n_samples)
+    t = np.zeros(n_samples)
+    
+    for i in prange(n_samples):
+        # Average of Open, High, Low
+        u[i] = np.sum(features[i + lookback, :3]) / 3
+        # Average of Volume, Return, LogReturn, Volatility
+        v[i] = np.sum(features[i + lookback, 3:7]) / 4
+        # Average of remaining features
+        t[i] = np.sum(features[i + lookback, 7:]) / (features.shape[1] - 7)
+    
+    # Ensure coordinates are within [0, 2π]
+    return (u % (2*np.pi), v % (2*np.pi), t % (2*np.pi))
 
-def predict_and_compare(wave_function, X_test, y_test, target_scaler, dates):
-    # Make predictions
-    raw_predictions = np.array([np.abs(wave_function(*coords)) for coords in X_test])
+class IOTMapper:
+    def __init__(self, iot: IOT, lookback: int):
+        self.iot = iot
+        self.lookback = lookback
+        self.feature_scaler = MinMaxScaler(feature_range=(0, 2*np.pi))
+        self.target_scaler = MinMaxScaler(feature_range=(0, 2*np.pi))
+
+    def map_to_iot(self, data: pd.DataFrame) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], 
+                                                     np.ndarray, 
+                                                     MinMaxScaler, 
+                                                     MinMaxScaler]:
+        """Map data to IOT coordinates using parallel processing."""
+        features = ['Open', 'High', 'Low', 'Volume', 'Return', 'LogReturn', 
+                   'Volatility', 'SMA_50', 'SMA_200', 'RSI', 'MACD', 'Signal', 'Close']
+        target = 'Close'
+        # Scale features and target
+        scaled_features = self.feature_scaler.fit_transform(data[features].values)
+        scaled_target = self.target_scaler.fit_transform(data[[target]].values)
+        # Prepare sequences using Numba-optimized function
+        coords = _compute_means(scaled_features, self.lookback)
+        y = scaled_target[self.lookback:].flatten()
+        return coords, y, self.feature_scaler, self.target_scaler
+
+class ModelTrainer:
+    def __init__(self, iot: IOT, l_max: int, m_max: int, db: IOTDatabase):
+        self.iot = iot
+        self.l_max = l_max
+        self.m_max = m_max
+        self.db = db
+
+    def setup_model(self) -> Tuple[WaveFunction, DoublyLinkedCausalEvolution]:
+        """Set up TIDAL model components."""
+        basis_functions = generate_basis_functions(self.l_max, self.m_max)
+        wave_function = WaveFunction(self.iot, basis_functions)
+        tautochrone_op = TautochroneOperator(self.iot)
+        obs_density = ObservationalDensity(
+            parameterized_complexity_function(128164, 128164, 128164)
+        )
+        warping_func = parameterized_warping_function(1e-33, 128164, 128164)
+        hamiltonian = parameterized_hamiltonian(warping_func)
+        evolution = DoublyLinkedCausalEvolution(
+            hamiltonian, tautochrone_op, tautochrone_op, obs_density, 
+            137.035999, 1e-33, 7.2973525643e-3
+        )
+        
+        return wave_function, evolution
+
+    def train(self, wave_function: WaveFunction, 
+             evolution: DoublyLinkedCausalEvolution,
+             X_train: List[Tuple[float, float, float]], 
+             y_train: np.ndarray,
+             num_epochs: int,
+             learning_rate: float,
+             batch_size: int = 128164) -> Tuple[WaveFunction, Dict[str, float]]:
+        """Train the model with wave-aware optimization."""
+        # Initialize wave-aware optimizer
+        optimizer = WaveAwareTIDALOptimizer(
+            wave_function,
+            learning_rate=learning_rate,
+            initial_weights=(0.4, 0.3, 0.3),  # directional, momentum, volatility
+            momentum_window=5,
+            volatility_window=21,
+            adaptation_rate=0.01,
+            clip_value=1.0
+        )
+        
+        # Initialize wave-aware trainer
+        trainer = ModelTrainer(
+            wave_function, 
+            optimizer, 
+            evolution, 
+            batch_size=batch_size
+        )
+        
+        # Setup learning rate scheduler
+        lr_scheduler = lambda epoch, lr: cosine_annealing_scheduler(
+            epoch, lr, T_max=num_epochs
+        )
+        
+        # Train the model
+        history = trainer.train(X_train, y_train, num_epochs, dt=1e-33, 
+                              lr_scheduler=lr_scheduler)
+        
+        # Calculate final performance metrics
+        final_epoch = history[-1]
+        metrics = {
+            'total_loss': final_epoch['directional'] + final_epoch['momentum'] + 
+                         final_epoch['volatility'],
+            'directional_loss': final_epoch['directional'],
+            'momentum_loss': final_epoch['momentum'],
+            'volatility_loss': final_epoch['volatility'],
+            'final_weights': (final_epoch['alpha'], final_epoch['beta'], 
+                            final_epoch['gamma'])
+        }
+        
+        return wave_function, metrics
+
+@jit(nopython=True)
+def _predict_batch(wave_function_values: np.ndarray) -> np.ndarray:
+    """JIT-optimized batch prediction."""
+    return np.abs(wave_function_values)
+
+class Predictor:
+    def __init__(self, wave_function: WaveFunction, target_scaler: MinMaxScaler):
+        self.wave_function = wave_function
+        self.target_scaler = target_scaler
+
+    def predict(self, X: List[Tuple[float, float, float]]) -> np.ndarray:
+        """Make predictions using parallel batch processing."""
+        batch_size = 128164
+        batches = [X[i:i + batch_size] for i in range(0, len(X), batch_size)]
+        
+        def process_batch(batch):
+            wave_values = np.array([self.wave_function(*coords) for coords in batch])
+            return _predict_batch(wave_values)
+        
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            raw_predictions = list(executor.map(process_batch, batches))
+        
+        predictions = np.concatenate(raw_predictions)
+        return self.target_scaler.inverse_transform(predictions.reshape(-1, 1))[:, 0]
+
+def main():
+    # Initialize components
+    data_loader = DataLoader()
+    df = data_loader.load_and_preprocess_data('EURUSD_merged.json')
     
-    # Denormalize predictions and actual values
-    y_pred = target_scaler.inverse_transform(raw_predictions.reshape(-1, 1))[:, 0]
-    y_actual = target_scaler.inverse_transform(y_test.reshape(-1, 1))[:, 0]
+    print(f"Loaded data shape: {df.shape}")
+    print(f"Date range: {df.index.min()} to {df.index.max()}")
     
-    # Create DataFrame for comparison
-    df_comparison = pd.DataFrame({
-        'Date': dates,
-        'Actual': y_actual,
-        'Predicted': y_pred
-    })
+    # Set up IOT and mapping
+    iot = IOT(R=(137.035999/136)*np.pi*4, r=(.707*.707))
+    mapper = IOTMapper(iot, lookback=128164)
     
-    # Calculate errors
-    df_comparison['Absolute_Error'] = np.abs(df_comparison['Actual'] - df_comparison['Predicted'])
-    df_comparison['Squared_Error'] = (df_comparison['Actual'] - df_comparison['Predicted'])**2
-    
-    # Save to CSV
-    df_comparison.to_csv('forex_prediction_comparison.csv', index=False)
-    
-    return df_comparison
-def save_model(wave_function, iot, feature_scaler, target_scaler, filename='tidal_model.pkl'):
-    model_data = {
-        'wave_function_coefficients': wave_function.coefficients,
-        'iot_params': {
-            'R': iot.R,
-            'r': iot.r
-        },
-        'basis_functions': wave_function.basis_functions,
-        'feature_scaler': feature_scaler,
-        'target_scaler': target_scaler
-    }
-    
-    with open(filename, 'wb') as f:
-        pickle.dump(model_data, f)
-    
-    print(f"Model saved successfully to {filename}")
-if __name__ == "__main__":
-    # Load and preprocess data
-    df = load_and_preprocess_data('EURUSD_M30.json')
-    
-    # Set up IOT
-    iot = IOT(R=(137.035999/136)*np.pi*4, r=0.5)
+    # Initialize IOT database
+    db = IOTDatabase(base_path="tidal_forex_models")
     
     # Map data to IOT surface
-    lookback = 1536
-    (X, y, feature_scaler, target_scaler) = map_to_iot(df, iot, lookback)
-
+    coords, y, feature_scaler, target_scaler = mapper.map_to_iot(df)
+    
     # Split data
-    X_train, X_test, y_train, y_test = train_test_split(list(zip(*X)), y, test_size=0.2, shuffle=False)
-
-    # Set up TIDAL model
-    wave_function, evolution = setup_tidal_model(iot, l_max=1, m_max=1)
-
-    # Train model
-    trained_wave_function = train_model(wave_function, evolution, X_train, y_train, num_epochs=10, learning_rate=1e-4)
-    test_dates = df.index[-len(X_test):]
-    df_comparison = predict_and_compare(trained_wave_function, X_test, y_test, target_scaler, test_dates)
-    # Make predictions
-    y_pred = predict(trained_wave_function, X_test, target_scaler)
-
-    # No need for inverse transform on y_pred, as it's done in the predict function
-    y_pred_original = y_pred
+    X_train, X_test, y_train, y_test = train_test_split(
+        list(zip(*coords)), y, test_size=0.01, shuffle=False
+    )
+    
+    # Set up and train model with wave-aware optimization
+    trainer = ModelTrainer(iot, l_max=1, m_max=1, db=db)
+    wave_function, evolution = trainer.setup_model()
+    trained_wave_function, metrics = trainer.train(
+        wave_function, evolution, X_train, y_train, 
+        num_epochs=500, learning_rate=1.007617639705882e-3
+    )
+    
+    # Make predictions for evaluation
+    predictor = Predictor(trained_wave_function, target_scaler)
+    y_pred = predictor.predict(X_test)
     y_test_original = target_scaler.inverse_transform(y_test.reshape(-1, 1))[:, 0]
-
-    # Evaluate model
-    mae = mean_absolute_error(y_test_original, y_pred_original)
-    print(f"Mean Absolute Error: {mae}")
-
-    save_model(trained_wave_function, iot, feature_scaler, target_scaler)
-
-    # Print model size for verification
-    import os
-    print(f"Saved model size: {os.path.getsize('tidal_model.pkl') / 1024:.2f} KB")
+    
+    # Calculate additional metrics
+    mse = mean_squared_error(y_test_original, y_pred)
+    mae = mean_absolute_error(y_test_original, y_pred)
+    metrics.update({
+        'mse': mse,
+        'mae': mae
+    })
+    
+    # Save model to database with enhanced metrics
+    model_id = db.save_model(trained_wave_function, performance_metrics=metrics)
+    print(f"Model saved with ID: {model_id}")
+    print("\nTraining Metrics:")
+    print(f"Total Loss: {metrics['total_loss']:.6f}")
+    print(f"Directional Loss: {metrics['directional_loss']:.6f}")
+    print(f"Momentum Loss: {metrics['momentum_loss']:.6f}")
+    print(f"Volatility Loss: {metrics['volatility_loss']:.6f}")
+    print(f"Final Weights (α,β,γ): {metrics['final_weights']}")
+    print(f"MSE: {metrics['mse']:.6f}")
+    print(f"MAE: {metrics['mae']:.6f}")
+    
+    # Save results
+    test_dates = df.index[-len(X_test):]
+    results_df = pd.DataFrame({
+        'Date': test_dates,
+        'Actual': y_test_original,
+        'Predicted': y_pred,
+        'Absolute_Error': np.abs(y_test_original - y_pred),
+        'Squared_Error': (y_test_original - y_pred)**2
+    })
+    
+    results_df.to_csv('forex_prediction_comparison.csv', index=False)
+    print(f"\nResults saved to forex_prediction_comparison.csv")
